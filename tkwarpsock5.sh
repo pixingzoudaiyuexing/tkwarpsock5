@@ -7,6 +7,10 @@ LOG_FILE="/var/log/${APP_NAME}.log"
 CONFIG_FILE="${APP_DIR}/config.env"
 DOMAIN_FILE="${APP_DIR}/tiktok-domains.txt"
 ROUTE_FILE="${APP_DIR}/v2node-route.json"
+MATCH_FILE="${APP_DIR}/v2board-match.txt"
+OUTBOUND_FILE="${APP_DIR}/outbound-socks.json"
+XRAY_EXAMPLE_FILE="${APP_DIR}/xray-routing-example.json"
+V2NODE_COMPAT_DIR="/etc/v2node/${APP_NAME}"
 SYSTEMD_SERVICE="/etc/systemd/system/${APP_NAME}-wireproxy.service"
 DEFAULT_PORT="40000"
 PORT="${DEFAULT_PORT}"
@@ -28,6 +32,11 @@ DEFAULT_DOMAINS=(
   "ibytedtos.com"
   "ibyteimg.com"
   "ipstatp.com"
+  "ttwstatic.com"
+  "bytefcdn-oversea.com"
+  "ttlivecdn.com"
+  "tiktokcdn-us.com"
+  "tiktokv.us"
   "p16-tiktokcdn-com.akamaized.net"
 )
 
@@ -41,7 +50,7 @@ Usage:
 Options:
   --port PORT             SOCKS5 listen port, default: 40000
   --add-domain DOMAIN     Add extra TikTok domain, can be repeated
-  --route-only            Only regenerate /etc/tkwarpsock5/v2node-route.json
+  --route-only            Only regenerate v2board/v2node route files
   --uninstall             Remove services/config created by this script
   -h, --help              Show help
 
@@ -366,29 +375,66 @@ json_escape() {
 
 write_route_json() {
   write_domains
-  local outbound_json encoded
+  local outbound_json encoded match_json
   outbound_json="$(jq -cn --argjson port "$PORT" '{
-    protocol: "socks",
     tag: "tiktok-warp",
+    protocol: "socks",
     settings: {
-      servers: [
-        {
-          address: "127.0.0.1",
-          port: $port
-        }
-      ]
+      address: "127.0.0.1",
+      port: $port
     }
   }')"
+  printf '%s\n' "$outbound_json" | jq . > "$OUTBOUND_FILE"
+  awk '{ printf "domain:%s\n", $0 }' "$DOMAIN_FILE" > "$MATCH_FILE"
+
   encoded="$(json_escape "$outbound_json")"
+  match_json="$(jq -R . "$MATCH_FILE" | jq -s .)"
   {
     printf '{\n'
     printf '  "action": "route",\n'
-    printf '  "match": [\n'
-    awk '{ printf "    \"domain:%s\"%s\n", $0, (NR==total ? "" : ",") }' total="$(wc -l < "$DOMAIN_FILE" | tr -d ' ')" "$DOMAIN_FILE"
-    printf '  ],\n'
+    printf '  "match": %s,\n' "$match_json"
     printf '  "action_value": %s\n' "$encoded"
     printf '}\n'
   } > "$ROUTE_FILE"
+
+  jq -n \
+    --argjson domains "$match_json" \
+    --slurpfile outbound "$OUTBOUND_FILE" \
+    '{
+      routing: {
+        domainStrategy: "AsIs",
+        rules: [
+          {
+            type: "field",
+            domain: $domains,
+            outboundTag: "tiktok-warp"
+          }
+        ]
+      },
+      outbounds: [$outbound[0]]
+    }' > "$XRAY_EXAMPLE_FILE"
+
+  if [ -d /etc/v2node ]; then
+    mkdir -p "$V2NODE_COMPAT_DIR"
+    cp "$DOMAIN_FILE" "$MATCH_FILE" "$OUTBOUND_FILE" "$ROUTE_FILE" "$XRAY_EXAMPLE_FILE" "$V2NODE_COMPAT_DIR"/
+    cat > "${V2NODE_COMPAT_DIR}/README.txt" <<EOF
+tkwarpsock5 v2node panel helper
+
+1. Run WARP SOCKS on this node:
+   bash <(curl -Ls https://raw.githubusercontent.com/pixingzoudaiyuexing/tkwarpsock5/main/tkwarpsock5.sh)
+
+2. In v2board route form:
+   备注: TikTok WARP
+   匹配值: paste ${V2NODE_COMPAT_DIR}/$(basename "$MATCH_FILE")
+   动作: 指定出站服务器(域名目标)
+   Xray出站配置: paste ${V2NODE_COMPAT_DIR}/$(basename "$OUTBOUND_FILE")
+
+3. Bind the route to the target node and restart v2node:
+   systemctl restart v2node
+
+The local SOCKS outbound is 127.0.0.1:${PORT}. v2node receives routes from the panel API; files in this directory are paste-ready references.
+EOF
+  fi
 }
 
 write_config() {
@@ -424,14 +470,20 @@ SOCKS5: 127.0.0.1:${PORT}
 Backend: ${BACKEND}
 Route: ${ROUTE_FILE}
 Domains: ${DOMAIN_FILE}
+v2board match: ${MATCH_FILE}
+v2board outbound: ${OUTBOUND_FILE}
 Log: ${LOG_FILE}
 
 Verify:
   curl --socks5-hostname 127.0.0.1:${PORT} https://www.cloudflare.com/cdn-cgi/trace
 
 v2node:
-  Copy ${ROUTE_FILE} into the route config of the target node in your panel,
-  then restart v2node or wait for it to pull the latest node config.
+  In the panel route form, paste ${MATCH_FILE} into match value,
+  choose "指定出站服务器(域名目标)", paste ${OUTBOUND_FILE} into Xray outbound config,
+  bind the route to the target node, then restart v2node or wait for it to pull config.
+
+  If /etc/v2node exists, paste-ready copies are also written to:
+    ${V2NODE_COMPAT_DIR}
 
 EOF
 }
