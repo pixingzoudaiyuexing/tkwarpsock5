@@ -1,0 +1,7 @@
+*.log
+*.tmp
+*.bak
+.DS_Store
+tmp/
+dist/
+coverage/
